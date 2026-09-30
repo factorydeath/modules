@@ -1755,6 +1755,15 @@ class YanMusicMod(loader.Module):
         "device_transfer_na": (
             "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Device switching is not exposed by upstream Ynison — control playback on the device itself.</b>"
         ),
+        "device_followed": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Following device:</b> {} <code>{}</code>"
+        ),
+        "device_follow_cleared": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Follow cleared — watching the active device.</b>"
+        ),
+        "not_on_followed": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Nothing is playing on 📌 {}.</b>\nActive: {}"
+        ),
         "invalid_device_id": (
             "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Invalid device ID."
             " Use</b> <code>.ymdev</code> <b>to see available devices.</b>"
@@ -1886,6 +1895,15 @@ class YanMusicMod(loader.Module):
         ),
         "device_transfer_na": (
             "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Переключение устройств не поддерживается upstream Ynison — управляй воспроизведением на самом устройстве.</b>"
+        ),
+        "device_followed": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Слежу за устройством:</b> {} <code>{}</code>"
+        ),
+        "device_follow_cleared": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Слежка снята — смотрю за активным устройством.</b>"
+        ),
+        "not_on_followed": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>На 📌 {} ничего не играет.</b>\nАктивно: {}"
         ),
         "invalid_device_id": (
             "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Некорректный ID устройства."
@@ -2055,6 +2073,77 @@ class YanMusicMod(loader.Module):
                 await utils.answer(message, self.strings("err").format(utils.escape_html(hint)))
             return None
         return self._cfg()
+
+    def _follow(self) -> str | None:
+        fid = (self.get("follow_device") or "").strip() if isinstance(self.get("follow_device"), str) else self.get("follow_device")
+        if fid is None:
+            return None
+        fid = str(fid).strip()
+        return fid or None
+
+    def _device_title(self, snap, did: str | None) -> str:
+        if not did:
+            return "—"
+        for d in list(getattr(snap, "devices", ()) or []):
+            if str(getattr(d, "id", "")) == str(did):
+                return str(getattr(d, "title", None) or did)
+        return str(did)
+
+    def _is_silent(self, snap) -> bool:
+        """True когда реально ничего не играет (а не пауза/старт)."""
+        if snap is None:
+            return True
+        tid = getattr(snap, "track_id", None)
+        title = getattr(snap, "track_title", None)
+        if not tid and not title:
+            return True
+        if not getattr(snap, "active_device_id", None):
+            return True
+        try:
+            raw = getattr(snap, "raw", None)
+            if raw is not None:
+                q = getattr(getattr(raw, "player_state", None), "player_queue", None)
+                items = getattr(q, "playable_list", None)
+                if items is not None and len(items) == 0:
+                    return True
+        except Exception:
+            pass
+        try:
+            dur = getattr(snap, "duration_ms", None)
+            prog = getattr(snap, "progress_ms", None)
+            dur_n = int(dur) if dur is not None else 0
+            prog_n = int(prog) if prog is not None else 0
+            if dur_n <= 0 and prog_n <= 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _snap_checked(self, message: Message, cfg):
+        """Fetch snap + follow-фильтр + silent-детект. Вернёт snap или None (ответ уже отправлен)."""
+        try:
+            snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return None
+        fid = self._follow()
+        if fid:
+            aid = str(getattr(snap, "active_device_id", None) or "")
+            if aid != str(fid):
+                fname = utils.escape_html(self._device_title(snap, fid))
+                if aid:
+                    aname = utils.escape_html(self._device_title(snap, aid))
+                else:
+                    aname = utils.escape_html(str(self.strings("no_music")))
+                await utils.answer(
+                    message,
+                    self.strings["not_on_followed"].format(fname, aname),
+                )
+                return None
+        if self._is_silent(snap):
+            await utils.answer(message, self.strings["no_music"])
+            return None
+        return snap
 
     def _get_chat_id(self, target):
         if isinstance(target, int):
@@ -2522,13 +2611,8 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
-        try:
-            snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-        except Exception as e:
-            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
-            return
-        if not getattr(snap, "track_title", None):
-            await utils.answer(message, self.strings["no_music"])
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
             return
         album = await self._album_of_snap(cfg.token, snap)
         await self._show_card(message, snap, cfg.token, album)
@@ -2541,13 +2625,8 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
-        try:
-            snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-        except Exception as e:
-            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
-            return
-        if not getattr(snap, "track_title", None):
-            await utils.answer(message, self.strings["no_music"])
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
             return
         album = await self._album_of_snap(cfg.token, snap)
         await self._show_card(message, snap, cfg.token, album)
@@ -2560,25 +2639,20 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
-        try:
-            snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-        except Exception as e:
-            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
             return
         track = getattr(snap, "track_title", None) or "Unknown"
         artists = getattr(snap, "artist_title", None) or "Unknown Artist"
-        if not getattr(snap, "track_title", None):
-            await utils.answer(message, self.strings["no_music"])
-            return
         album = await self._album_of_snap(cfg.token, snap)
         text = await self._card_text(snap, album)
         msg = await utils.answer(message, text + self.strings["downloading_track"])
         await self._download_track(msg, f"{artists} {track}", caption=text, track_name=str(track), artists=str(artists))
 
-    # ---------- devices ----------
+    # ---------- devices + follow ----------
     @error_handler
     @tokenized
-    @loader.command(ru_doc="| .ymdev - 🎵 Список устройств")
+    @loader.command(ru_doc="| .ymdev - 🎵 Список/выбор устройства: .ymdev <номер|id|off>")
     async def ymdev(self, message: Message):
         """| .ymdev - 🎵 Devices"""
         cfg = await self._need_remote(message)
@@ -2591,17 +2665,58 @@ class YanMusicMod(loader.Module):
             await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
             return
         devices = list(getattr(snap, "devices", ()) or [])
-        if args:
-            await utils.answer(message, self.strings["device_transfer_na"])
-            return
         if not devices:
             await utils.answer(message, self.strings["no_devices_found"])
             return
+        if args:
+            low = args.strip().lower()
+            if low in ("off", "0", "clear", "-", "none"):
+                self.set("follow_device", None)
+                await utils.answer(message, self.strings["device_follow_cleared"])
+                return
+            pick = None
+            first = args.split()[0]
+            if first.isdigit():
+                idx = int(first) - 1
+                if 0 <= idx < len(devices):
+                    pick = devices[idx]
+                else:
+                    await utils.answer(message, self.strings["invalid_device_id"])
+                    return
+            else:
+                for d in devices:
+                    if str(getattr(d, "id", "")) == args.strip():
+                        pick = d
+                        break
+                if pick is None:
+                    for d in devices:
+                        title = str(getattr(d, "title", None) or "")
+                        if args.strip().lower() in title.lower():
+                            pick = d
+                            break
+                if pick is None:
+                    await utils.answer(message, self.strings["invalid_device_id"])
+                    return
+            fid = str(getattr(pick, "id", ""))
+            self.set("follow_device", fid)
+            await utils.answer(
+                message,
+                self.strings["device_followed"].format(
+                    utils.escape_html(str(getattr(pick, "title", None) or fid)), utils.escape_html(fid)
+                ),
+            )
+            return
+        fid = self._follow()
         lines = ""
         for i, d in enumerate(devices):
             title = getattr(d, "title", None) or getattr(d, "id", "?")
-            active = "(active)" if getattr(d, "active", False) else ""
-            lines += f"<b>{i + 1}.</b> {utils.escape_html(str(title))} {active}\n"
+            marks = ""
+            if getattr(d, "active", False):
+                marks += "🟢"
+            if fid and str(getattr(d, "id", "")) == str(fid):
+                marks += "📌"
+            marks = (marks + " ") if marks else ""
+            lines += f"<b>{i + 1}.</b> {marks}{utils.escape_html(str(title))} <code>{utils.escape_html(str(getattr(d, 'id', '?')))}</code>\n"
         await utils.answer(message, self.strings["device_list"].format(lines.strip()))
 
     # ---------- transport ----------
@@ -2645,6 +2760,16 @@ class YanMusicMod(loader.Module):
             return
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+            fid = self._follow()
+            if fid and str(getattr(snap, "active_device_id", None) or "") != str(fid):
+                fname = utils.escape_html(self._device_title(snap, fid))
+                aid = str(getattr(snap, "active_device_id", None) or "")
+                aname = utils.escape_html(self._device_title(snap, aid)) if aid else utils.escape_html(str(self.strings("no_music")))
+                await utils.answer(message, self.strings["not_on_followed"].format(fname, aname))
+                return
+            if self._is_silent(snap):
+                await utils.answer(message, self.strings["no_music"])
+                return
             if snap.paused:
                 await aonshot_resume(cfg.token, cfg.device_id, cfg.timeout)
             else:
@@ -2672,6 +2797,13 @@ class YanMusicMod(loader.Module):
             await asyncio.sleep(2.5)
             try:
                 snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+                fid = self._follow()
+                if fid and str(getattr(snap, "active_device_id", None) or "") != str(fid):
+                    await utils.answer(message, self.strings["skipped"])
+                    return
+                if self._is_silent(snap):
+                    await utils.answer(message, self.strings["skipped"])
+                    return
                 album = await self._album_of_snap(cfg.token, snap)
                 await self._show_card(message, snap, cfg.token, album)
                 return
@@ -2700,6 +2832,13 @@ class YanMusicMod(loader.Module):
             await asyncio.sleep(2.5)
             try:
                 snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+                fid = self._follow()
+                if fid and str(getattr(snap, "active_device_id", None) or "") != str(fid):
+                    await utils.answer(message, self.strings["back"])
+                    return
+                if self._is_silent(snap):
+                    await utils.answer(message, self.strings["back"])
+                    return
                 album = await self._album_of_snap(cfg.token, snap)
                 await self._show_card(message, snap, cfg.token, album)
                 return
@@ -2738,7 +2877,8 @@ class YanMusicMod(loader.Module):
             await utils.answer(message, self.strings["volume_invalid"])
             return
         try:
-            await aonshot_volume(cfg.token, v, None, cfg.device_id, cfg.timeout)
+            target = self._follow()
+            await aonshot_volume(cfg.token, v, target, cfg.device_id, cfg.timeout)
             await utils.answer(message, self.strings["volume_changed"].format(int(round(v * 100))))
         except (SDKError, ValueError) as e:
             await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
@@ -2746,6 +2886,11 @@ class YanMusicMod(loader.Module):
     # ---------- likes (current track via REST) ----------
     async def _current_track_ids(self, cfg) -> tuple | None:
         snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+        if self._is_silent(snap):
+            return None
+        fid = self._follow()
+        if fid and str(getattr(snap, "active_device_id", None) or "") != str(fid):
+            return None
         tid = getattr(snap, "track_id", None)
         if not tid:
             return None
@@ -2769,14 +2914,16 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
+            return
         try:
-            ids = await self._current_track_ids(cfg)
-            if not ids:
+            tid = getattr(snap, "track_id", None)
+            if not tid:
                 await utils.answer(message, self.strings["no_music"])
                 return
-            tid, _ = ids
             async with self._rest() as ym:
-                await ym.likes.add_track([tid])
+                await ym.likes.add_track([str(tid)])
             await utils.answer(message, self.strings["liked"])
         except Exception as e:
             await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
@@ -2789,14 +2936,16 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
+            return
         try:
-            ids = await self._current_track_ids(cfg)
-            if not ids:
+            tid = getattr(snap, "track_id", None)
+            if not tid:
                 await utils.answer(message, self.strings["no_music"])
                 return
-            tid, _ = ids
             async with self._rest() as ym:
-                await ym.likes.remove_track([tid])
+                await ym.likes.remove_track([str(tid)])
             await utils.answer(message, self.strings["unlike"])
         except Exception as e:
             await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
@@ -2935,12 +3084,25 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
+            return
         try:
-            ids = await self._current_track_ids(cfg)
-            if not ids:
+            tid = getattr(snap, "track_id", None)
+            if not tid:
                 await utils.answer(message, self.strings["no_music"])
                 return
-            tid, album_id = ids
+            tid = str(tid)
+            album_id = None
+            try:
+                async with AsyncYandexMusic(token=cfg.token) as ym0:
+                    tracks = await ym0.tracks.get([tid])
+                    if tracks:
+                        albums = getattr(tracks[0], "albums", None) or []
+                        if albums:
+                            album_id = getattr(albums[0], "id", None)
+            except Exception:
+                pass
             if not album_id:
                 await utils.answer(message, self.strings["err"].format("no album_id for track"))
                 return
@@ -2970,12 +3132,15 @@ class YanMusicMod(loader.Module):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
+        snap = await self._snap_checked(message, cfg)
+        if snap is None:
+            return
         try:
-            ids = await self._current_track_ids(cfg)
-            if not ids:
+            tid = getattr(snap, "track_id", None)
+            if not tid:
                 await utils.answer(message, self.strings["no_music"])
                 return
-            tid, _ = ids
+            tid = str(tid)
             pl = playlists[index]
             async with self._rest() as ym:
                 uid = await self._uid()
