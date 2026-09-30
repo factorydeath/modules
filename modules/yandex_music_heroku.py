@@ -11,7 +11,7 @@ aonshot_*), клиент AsyncYandexMusic. Работает на coddrago/Heroku
 
 from __future__ import annotations
 
-__version__ = (1, 2, 0)
+__version__ = (1, 3, 0)
 
 import asyncio
 import contextlib
@@ -66,7 +66,6 @@ class SDKConfig:
 
     def validate_token(self, *, allow_empty: bool=False) -> str:
         """Вернуть токен или кинуть понятную ошибку."""
-        from .errors import AuthenticationError
         token = (self.token or '').strip()
         if not token and (not allow_empty):
             raise AuthenticationError("Missing Yandex Music token. Pass token='...' or set YANDEX_MUSIC_TOKEN env var.")
@@ -200,7 +199,6 @@ def resolve_token(explicit: str | None=None, config_token: str | None=None) -> s
 
 async def retry_async(fn: Callable[[], Awaitable[T]], attempts: int, base_delay: float, max_delay: float) -> T:
     """Async-вариант exponential backoff."""
-    from .errors import RetryExhausted
     last: Exception | None = None
     total = max(1, attempts)
     for number in range(total):
@@ -1003,7 +1001,6 @@ class AsyncRemotePlayer:
                 if inspect.isawaitable(state):
                     state = await state
             if state is None:
-                from .errors import RemoteConnectionError
                 raise RemoteConnectionError('No Ynison state yet: client not connected.')
             return snapshot_from_state(state)
 
@@ -1259,15 +1256,12 @@ class AsyncYandexMusic:
         return self.config.timeout if timeout is None else timeout
 
     async def remote_state(self, timeout: float | None=None):
-        from .remote import aonshot_state
         return await aonshot_state(self.config.validate_token(), device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def remote_pause(self, timeout: float | None=None):
-        from .remote import aonshot_pause
         return await aonshot_pause(self.config.validate_token(), device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def remote_resume(self, timeout: float | None=None):
-        from .remote import aonshot_resume
         return await aonshot_resume(self.config.validate_token(), device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def remote_toggle(self, timeout: float | None=None):
@@ -1277,15 +1271,12 @@ class AsyncYandexMusic:
         return await self.remote_resume(timeout=timeout)
 
     async def remote_next(self, timeout: float | None=None):
-        from .remote import aonshot_next
         return await aonshot_next(self.config.validate_token(), device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def remote_prev(self, timeout: float | None=None):
-        from .remote import aonshot_prev
         return await aonshot_prev(self.config.validate_token(), device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def remote_set_volume(self, volume: float, target_device_id: str | None=None, timeout: float | None=None):
-        from .remote import aonshot_volume
         return await aonshot_volume(self.config.validate_token(), volume, target_device_id=target_device_id, device_id=self.config.device_id, timeout=self._one_shot_timeout(timeout))
 
     async def close(self):
@@ -1352,12 +1343,49 @@ async def _ensure_ynison() -> tuple:
     return False, "restart"
 
 
-def _bar(progress, duration, width=10):
+def _bar(progress, duration, width=12):
     if not progress or not duration:
-        return "─" * width
+        return "▱" * width
     r = max(0.0, min(1.0, progress / duration))
     f = int(round(r * width))
-    return "●" * f + "─" * (width - f)
+    return "▰" * f + "▱" * (width - f)
+
+
+def _cover_url_from_track(track) -> str | None:
+    uri = getattr(track, "cover_uri", None)
+    if not uri:
+        return None
+    return "https://" + str(uri).replace("%%", "400x400")
+
+
+async def _resolve_cover(token: str, snap) -> str | None:
+    """Обложка трека через REST: сначала по id, потом поиском. None если не вышло."""
+    try:
+        async with AsyncYandexMusic(token=token) as ym:
+            tid = getattr(snap, "track_id", None)
+            if tid:
+                try:
+                    tracks = await ym.tracks.get([str(tid)])
+                    if tracks:
+                        url = _cover_url_from_track(tracks[0])
+                        if url:
+                            return url
+                except Exception:
+                    pass
+            query = " ".join(x for x in (snap.artist_title, snap.track_title) if x)
+            if query:
+                try:
+                    res = await ym.search.query(query)
+                    results = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
+                    if results:
+                        url = _cover_url_from_track(results[0])
+                        if url:
+                            return url
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
 
 
 @loader.tds
@@ -1438,9 +1466,9 @@ class YandexMusicMod(loader.Module):
             title = f"{snap.artist_title} — {title}"
         bar = _bar(snap.progress_ms, snap.duration_ms)
         out = [
-            self.strings["state_title"],
+            "🪐 <b>Yandex Music</b>",
             f"🎵 <b>{html.escape(str(title))}</b>",
-            f"{st} | <code>{_fmt_ms(snap.progress_ms)}/{_fmt_ms(snap.duration_ms)}</code>",
+            f"{st} | <code>{_fmt_ms(snap.progress_ms)} / {_fmt_ms(snap.duration_ms)}</code>",
             f"<code>{bar}</code>",
             f"📱 <code>{html.escape(str(snap.active_device_id or '-'))}</code>",
         ]
@@ -1448,9 +1476,26 @@ class YandexMusicMod(loader.Module):
             out.append("")
             out.append(self.strings["devices_title"])
             for d in snap.devices[:10]:
-                mark = "●" if d.active else "○"
+                mark = "🟢" if d.active else "⚪"
                 out.append(f"{mark} {html.escape(str(d.title or d.id))} <code>{html.escape(d.id)}</code>")
+        out.append("")
+        out.append("⚡ <i>YandexMusic v1.3.0</i>")
         return "\n".join(out)
+
+    async def _banner(self, message: Message, snap: Playback, token: str) -> None:
+        """Баннер трека: обложка + подпись. Без обложки — просто текст."""
+        caption = self._snap_text(snap)
+        try:
+            cover = await _resolve_cover(token, snap)
+        except Exception:
+            cover = None
+        if cover:
+            try:
+                await utils.answer_file(message, cover, caption)
+                return
+            except Exception:
+                pass
+        await utils.answer(message, caption)
 
     async def _need_remote(self, message: Message):
         """Токен + ynison. Возвращает cfg или None (ответ уже отправлен)."""
@@ -1532,29 +1577,26 @@ class YandexMusicMod(loader.Module):
     # ---------- remote (async one-shot) ----------
     @loader.command(ru_doc="Статус плеера")
     async def ymstatus(self, message: Message):
-        """Статус плеера"""
+        """Статус плеера + баннер"""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
         await utils.answer(message, "⏳ ...")
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-            await utils.answer(message, self._snap_text(snap))
+            await self._banner(message, snap, cfg.token)
         except SDKError as e:
             await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
 
-    @loader.command(ru_doc="Что играет")
+    @loader.command(ru_doc="Что играет + баннер")
     async def ymcur(self, message: Message):
-        """Что играет"""
+        """Что играет + баннер"""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-            t = snap.track_title or "-"
-            if snap.artist_title:
-                t = f"{snap.artist_title} — {t}"
-            await utils.answer(message, f"🎵 <b>{html.escape(t)}</b>")
+            await self._banner(message, snap, cfg.token)
         except SDKError as e:
             await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
 
@@ -1571,18 +1613,27 @@ class YandexMusicMod(loader.Module):
                 return
             out = [self.strings["devices_title"]]
             for d in snap.devices:
-                mark = "●" if d.active else "○"
+                mark = "🟢" if d.active else "⚪"
                 out.append(f"{mark} {html.escape(str(d.title or d.id))} <code>{html.escape(d.id)}</code>")
             await utils.answer(message, "\n".join(out))
         except SDKError as e:
             await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
 
-    async def _do(self, coro, message: Message, label: str):
+    async def _do(self, coro, message: Message, label: str, banner: bool = False):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
         try:
             await coro(cfg)
+            if banner:
+                # Даём серверу переключить трек — затем баннер нового трека.
+                await asyncio.sleep(2.5)
+                try:
+                    snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+                    await self._banner(message, snap, cfg.token)
+                    return
+                except Exception:
+                    pass
             await utils.answer(message, self.strings["sent"].format(label))
         except NoActiveDeviceError:
             await utils.answer(message, "⏹ Нет активного устройства — включи музыку в приложении")
@@ -1623,20 +1674,20 @@ class YandexMusicMod(loader.Module):
         except SDKError as e:
             await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
 
-    @loader.command(ru_doc="Следующий трек")
+    @loader.command(ru_doc="Следующий трек + баннер")
     async def ymnext(self, message: Message):
-        """Следующий трек"""
+        """Следующий трек + баннер"""
         await self._do(
             lambda cfg: aonshot_next(cfg.token, cfg.device_id, cfg.timeout),
-            message, "⏭ next",
+            message, "⏭ next", banner=True,
         )
 
-    @loader.command(ru_doc="Предыдущий трек")
+    @loader.command(ru_doc="Предыдущий трек + баннер")
     async def ymprev(self, message: Message):
-        """Предыдущий трек"""
+        """Предыдущий трек + баннер"""
         await self._do(
             lambda cfg: aonshot_prev(cfg.token, cfg.device_id, cfg.timeout),
-            message, "⏮ prev",
+            message, "⏮ prev", banner=True,
         )
 
     @loader.command(ru_doc="Громкость: .ymvol 50")
@@ -1658,7 +1709,10 @@ class YandexMusicMod(loader.Module):
             v /= 100.0
         try:
             await aonshot_volume(cfg.token, v, None, cfg.device_id, cfg.timeout)
-            await utils.answer(message, self.strings["vol"].format(v))
+            filled = int(round(v * 10))
+            await utils.answer(
+                message, f"🔊 <code>{'▰' * filled}{'▱' * (10 - filled)}</code> {v:.0%}"
+            )
         except ValueError:
             await utils.answer(message, "❌ Громкость: 0-100 или 0.0-1.0")
         except SDKError as e:
