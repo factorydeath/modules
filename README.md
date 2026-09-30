@@ -8,9 +8,11 @@
 .dlmod https://raw.githubusercontent.com/factorydeath/modules/main/modules/yandex_music_heroku.py
 ```
 
-## YandexMusic
+## YanMusic
 
-🎧 Яндекс Музыка: весь SDK + пульт в одном файле (`modules/yandex_music_heroku.py`).
+🎧 Яндекс Музыка в стиле SpotifyMod: async SDK + PIL-баннеры (horizontal/vertical/ultra) в одном файле (`modules/yandex_music_heroku.py`).
 
-Команды: `.ymtoken` `.ymstatus` `.ymcur` `.ymdev` `.ympause` `.ymplay`
-`.ymtoggle` `.ymnext` `.ymprev` `.ymvol` `.ymsearch` `.ymlikes` `.ymplaylists` `.ymacc`
+Команды: `.ymauth` `.ymcode` `.ymtoken` `.ymunauth` `.ymstatus` `.ymcur` `.ymdown`
+`.ymdev` `.ympause` `.ymplay` `.ymtoggle` `.ymnext` `.ymprev` `.ymvol`
+`.ymlike` `.ymunlike` `.ymlikes` `.ymsearch` `.ymplaylists` `.ympla` `.ymplr`
+`.ymplc` `.ympld` `.ymacc`, инлайн `ymq`

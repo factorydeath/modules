@@ -1,28 +1,45 @@
-# requires: requests websockets betterproto aiohttp aiofiles
+# requires: requests websockets betterproto aiohttp aiofiles pillow yt-dlp curl_cffi
 # meta developer: @yandex_music_sdk_pro
+# scope: ffmpeg
 # scope: heroku_min 1.5.0
 # scope: hikka_min 1.6.0
-"""🎧 Yandex Music — ПОЛНЫЙ ASYNC SDK в одном файле + пульт юзербота.
+"""🎧 YanMusic — Яндекс Музыка в стиле SpotifyMod: async SDK + PIL-баннеры.
 
-Внутри (всё async, синхрона нет): config, errors, utils, models,
-services (все 22 домена, Async*), remote (snapshot, AsyncRemotePlayer,
-aonshot_*), клиент AsyncYandexMusic. Работает на coddrago/Heroku и Hikka.
+Внутри: config, errors, utils, models, services (22 домена, Async*),
+remote (snapshot, AsyncRemotePlayer, aonshot_*), клиент AsyncYandexMusic,
+Banners (horizontal/vertical/ultra) + YanMusicMod (ym* команды).
 """
 
 from __future__ import annotations
 
-__version__ = (1, 3, 0)
+__version__ = (1, 5, 0)
 
 import asyncio
 import contextlib
+import functools
 import html
+import io
 import logging
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
+import textwrap
+import time
+import traceback
 from dataclasses import dataclass, field
+from types import FunctionType
 from typing import Any
+
+import requests
+
+try:
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
 
 try:  # Heroku-форк coddrago
     from heroku import loader, utils
@@ -1299,9 +1316,9 @@ class AsyncYandexMusic:
         return False
 __all__ = ['YandexMusic', 'AsyncYandexMusic']
 
-# ============================ MODULE (Heroku/Hikka, async-only) ============================
-# Всё выше — полный ASYNC SDK. Ниже — команды юзербота на его основе.
-# Никакого синхрона: только await, ClientAsync, aonshot_*.
+# ============================ MODULE YanMusicMod (Heroku/Hikka, async-only, Spotify-style) ============================
+# Механизм как в YandexMusicMod (async SDK + Ynison one-shot), оформление 1:1 как в SpotifyMod:
+# Banners (horizontal/vertical/ultra), custom_text, yt-dlp скачивание, инлайн-поиск, плейлисты/лайки.
 
 AUTH_URL = (
     "https://oauth.yandex.ru/authorize?response_type=token"
@@ -1313,7 +1330,6 @@ GIT_MAIN = "git+https://github.com/MarshalX/yandex-music-api.git"
 def _has_ynison() -> bool:
     try:
         import yandex_music.ynison  # noqa: F401
-
         return True
     except ImportError:
         return False
@@ -1330,7 +1346,7 @@ async def _pip(*args: str) -> None:
 
 
 async def _ensure_ynison() -> tuple:
-    """PyPI 3.0.0 НЕ содержит ynison (только main #716) — ставим с гитхаба."""
+    """PyPI 3.0.0 НЕ содержит ynison (только main) — ставим с гитхаба."""
     if _has_ynison():
         return True, ""
     try:
@@ -1343,76 +1359,554 @@ async def _ensure_ynison() -> tuple:
     return False, "restart"
 
 
-def _bar(progress, duration, width=12):
-    if not progress or not duration:
-        return "▱" * width
-    r = max(0.0, min(1.0, progress / duration))
-    f = int(round(r * width))
-    return "▰" * f + "▱" * (width - f)
+class Banners:
+    def __init__(
+        self,
+        title: str,
+        artists: list,
+        duration: int,
+        progress: int,
+        track_cover: bytes,
+        font,
+        blur,
+        album_title: str = "",
+        meta_info: str = "",
+    ):
+        self.title = title
+        self.artists = ", ".join(artists) if isinstance(artists, list) else artists
+        self.duration = duration
+        self.progress = progress
+        self.track_cover = track_cover
+        self.font_url = font
+        self.blur_intensity = blur
+        self.album_title = album_title
+        self.meta_info = meta_info
 
+    def _get_font(self, size, font_bytes):
+        return ImageFont.truetype(io.BytesIO(font_bytes), size)
 
-def _cover_url_from_track(track) -> str | None:
-    uri = getattr(track, "cover_uri", None)
-    if not uri:
-        return None
-    return "https://" + str(uri).replace("%%", "400x400")
+    def _prepare_cover(self, size, radius):
+        cover = Image.open(io.BytesIO(self.track_cover)).convert("RGBA")
+        cover = cover.resize((size, size), Image.Resampling.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, size, size), radius=radius, fill=255)
+        output = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        output.paste(cover, (0, 0), mask=mask)
+        return output
 
+    def _prepare_background(self, w, h):
+        bg = Image.open(io.BytesIO(self.track_cover)).convert("RGBA")
+        bg = bg.resize((w, h), Image.Resampling.LANCZOS)
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=self.blur_intensity))
+        bg = ImageEnhance.Brightness(bg).enhance(0.35)
+        return bg
 
-async def _resolve_cover(token: str, snap) -> str | None:
-    """Обложка трека через REST: сначала по id, потом поиском. None если не вышло."""
-    try:
-        async with AsyncYandexMusic(token=token) as ym:
-            tid = getattr(snap, "track_id", None)
-            if tid:
-                try:
-                    tracks = await ym.tracks.get([str(tid)])
-                    if tracks:
-                        url = _cover_url_from_track(tracks[0])
-                        if url:
-                            return url
-                except Exception:
-                    pass
-            query = " ".join(x for x in (snap.artist_title, snap.track_title) if x)
-            if query:
-                try:
-                    res = await ym.search.query(query)
-                    results = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
-                    if results:
-                        url = _cover_url_from_track(results[0])
-                        if url:
-                            return url
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return None
+    def _draw_progress_bar(self, draw, x, y, w, h, progress_pct, color="white", bg_color="#6b6b6b"):
+        draw.rounded_rectangle((x, y, x + w, y + h), radius=h / 2, fill=bg_color)
+        fill_w = int(w * progress_pct)
+        if fill_w > 0:
+            draw.rounded_rectangle((x, y, x + fill_w, y + h), radius=h / 2, fill=color)
+
+    def horizontal(self):
+        W, H = 1500, 600
+        padding = 60
+        cover_size = 480
+        font_bytes = requests.get(self.font_url).content
+        title_font = self._get_font(55, font_bytes)
+        artist_font = self._get_font(45, font_bytes)
+        time_font = self._get_font(25, font_bytes)
+        img = self._prepare_background(W, H)
+        draw = ImageDraw.Draw(img)
+        cover = self._prepare_cover(cover_size, 30)
+        img.paste(cover, (padding, (H - cover_size) // 2), cover)
+        text_x = padding + cover_size + 60
+        text_y_start = 100
+        text_width_limit = W - text_x - padding
+        wrapper = textwrap.TextWrapper(width=23)
+        title_lines = wrapper.wrap(self.title)
+        if len(title_lines) > 2:
+            title_lines = title_lines[:2]
+            title_lines[-1] += "..."
+        current_y = text_y_start
+        title_height = title_font.getbbox("Ah")[3] + 15
+        for line in title_lines:
+            draw.text((text_x, current_y), line, font=title_font, fill="white")
+            current_y += title_height
+        display_artist = self.artists
+        while artist_font.getlength(display_artist) > text_width_limit and len(display_artist) > 0:
+            display_artist = display_artist[:-1]
+        if len(display_artist) < len(self.artists):
+            display_artist += "…"
+        artist_y = current_y + 10
+        draw.text((text_x, artist_y), display_artist, font=artist_font, fill="#b3b3b3")
+        cur_time = f"{(self.progress // 1000 // 60):02}:{(self.progress // 1000 % 60):02}"
+        dur_time = f"{(self.duration // 1000 // 60):02}:{(self.duration // 1000 % 60):02}"
+        cur_w = time_font.getlength(cur_time)
+        dur_w = time_font.getlength(dur_time)
+        bar_y = 480
+        bar_h = 8
+        gap = 25
+        draw.text((text_x, bar_y - 12), cur_time, font=time_font, fill="white")
+        bar_start_x = text_x + cur_w + gap
+        bar_end_x = text_x + text_width_limit - dur_w - gap
+        bar_w = bar_end_x - bar_start_x
+        prog_pct = self.progress / self.duration if self.duration > 0 else 0
+        self._draw_progress_bar(draw, bar_start_x, bar_y, bar_w, bar_h, prog_pct)
+        draw.text((bar_end_x + gap, bar_y - 12), dur_time, font=time_font, fill="white")
+        by = io.BytesIO()
+        img.save(by, format="PNG")
+        by.seek(0)
+        by.name = "banner.png"
+        return by
+
+    def vertical(self):
+        W, H = 1000, 1500
+        padding = 80
+        cover_size = 800
+        font_bytes = requests.get(self.font_url).content
+        title_font = self._get_font(60, font_bytes)
+        artist_font = self._get_font(45, font_bytes)
+        time_font = self._get_font(35, font_bytes)
+        img = self._prepare_background(W, H)
+        draw = ImageDraw.Draw(img)
+        cover = self._prepare_cover(cover_size, 40)
+        cover_x = (W - cover_size) // 2
+        cover_y = 120
+        img.paste(cover, (cover_x, cover_y), cover)
+        text_area_y = cover_y + cover_size + 120
+        text_width_limit = W - (padding * 2)
+        wrapper = textwrap.TextWrapper(width=23)
+        title_lines = wrapper.wrap(self.title)
+        if len(title_lines) > 2:
+            title_lines = title_lines[:2]
+            title_lines[-1] += "..."
+        current_y = text_area_y
+        title_height = title_font.getbbox("Ah")[3] + 15
+        for line in title_lines:
+            w = title_font.getlength(line)
+            draw.text(((W - w) / 2, current_y), line, font=title_font, fill="white")
+            current_y += title_height
+        display_artist = self.artists
+        while artist_font.getlength(display_artist) > text_width_limit and len(display_artist) > 0:
+            display_artist = display_artist[:-1]
+        if len(display_artist) < len(self.artists):
+            display_artist += "…"
+        artist_w = artist_font.getlength(display_artist)
+        draw.text(((W - artist_w) / 2, current_y + 15), display_artist, font=artist_font, fill="#b3b3b3")
+        bar_y = text_area_y + 260
+        if len(title_lines) > 1:
+            bar_y += 60
+        bar_h = 8
+        bar_w = W - (padding * 2)
+        prog_pct = self.progress / self.duration if self.duration > 0 else 0
+        self._draw_progress_bar(draw, padding, bar_y, bar_w, bar_h, prog_pct, color="white", bg_color="#6b6b6b")
+        cur_time = f"{(self.progress // 1000 // 60):02}:{(self.progress // 1000 % 60):02}"
+        dur_time = f"{(self.duration // 1000 // 60):02}:{(self.duration // 1000 % 60):02}"
+        draw.text((padding, bar_y + 40), cur_time, font=time_font, fill="white")
+        dur_w = time_font.getlength(dur_time)
+        draw.text((W - padding - dur_w, bar_y + 40), dur_time, font=time_font, fill="white")
+        by = io.BytesIO()
+        img.save(by, format="PNG")
+        by.seek(0)
+        by.name = "banner.png"
+        return by
+
+    def ultra(self) -> io.BytesIO:
+        WIDTH, HEIGHT = 2560, 1220
+        font_bytes = requests.get(self.font_url).content
+
+        def get_font(size):
+            try:
+                return ImageFont.truetype(io.BytesIO(font_bytes), size)
+            except Exception:
+                return ImageFont.load_default()
+
+        try:
+            original_cover = Image.open(io.BytesIO(self.track_cover)).convert("RGBA")
+        except Exception:
+            original_cover = Image.new("RGBA", (1000, 1000), "black")
+        dominant_color_img = original_cover.resize((1, 1), Image.Resampling.LANCZOS)
+        dominant_color = dominant_color_img.getpixel((0, 0))
+        r, g, b, a = dominant_color
+        brightness = (r * 299 + g * 587 + b * 114) / 1000
+        if brightness < 60:
+            r = min(255, r + 60)
+            g = min(255, g + 60)
+            b = min(255, b + 60)
+            dominant_color = (r, g, b, 255)
+        background = original_cover.copy()
+        bg_w, bg_h = background.size
+        target_ratio = WIDTH / HEIGHT
+        current_ratio = bg_w / bg_h
+        if current_ratio > target_ratio:
+            new_w = int(bg_h * target_ratio)
+            offset = (bg_w - new_w) // 2
+            background = background.crop((offset, 0, offset + new_w, bg_h))
+        else:
+            new_h = int(bg_w / target_ratio)
+            offset = (bg_h - new_h) // 2
+            background = background.crop((0, offset, bg_w, offset + new_h))
+        background = background.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        if self.blur_intensity > 0:
+            background = background.filter(ImageFilter.GaussianBlur(radius=self.blur_intensity))
+        dark_overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 180))
+        background = Image.alpha_composite(background, dark_overlay)
+        cover_size = 500
+        cover_x = (WIDTH - cover_size) // 2
+        cover_y = 160
+        glow_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        draw_glow = ImageDraw.Draw(glow_layer)
+        glow_rect_size = 620
+        g_x = (WIDTH - glow_rect_size) // 2
+        g_y = cover_y + (cover_size - glow_rect_size) // 2
+        draw_glow.rounded_rectangle(
+            (g_x, g_y, g_x + glow_rect_size, g_y + glow_rect_size),
+            radius=50,
+            fill=dominant_color,
+        )
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=60))
+        glow_layer = ImageEnhance.Brightness(glow_layer).enhance(1.4)
+        glow_layer = ImageEnhance.Color(glow_layer).enhance(1.2)
+        background = Image.alpha_composite(background, glow_layer)
+        cover_img = original_cover.resize((cover_size, cover_size), Image.Resampling.LANCZOS)
+        mask = Image.new("L", (cover_size, cover_size), 0)
+        draw_mask = ImageDraw.Draw(mask)
+        draw_mask.rounded_rectangle((0, 0, cover_size, cover_size), radius=45, fill=255)
+        background.paste(cover_img, (cover_x, cover_y), mask)
+        draw = ImageDraw.Draw(background)
+        center_x = WIDTH // 2
+        current_y = cover_y + cover_size + 130
+
+        def draw_text_shadow(text, pos, font, fill="white", anchor="ms"):
+            x, y = pos
+            draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 240), anchor=anchor)
+            draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
+
+        font_title = get_font(100)
+        title_text = self.title if len(self.title) <= 30 else self.title[:30] + "..."
+        draw_text_shadow(title_text.upper(), (center_x, current_y), font_title)
+        current_y += 85
+        font_artist = get_font(65)
+        artist_text = self.artists if len(self.artists) <= 45 else self.artists[:45] + "..."
+        draw_text_shadow(artist_text.upper(), (center_x, current_y), font_artist, fill=(255, 255, 255, 240))
+        current_y += 80
+        bar_width = 800
+        font_time = get_font(40)
+        bar_start_x = center_x - (bar_width // 2)
+        bar_end_x = center_x + (bar_width // 2)
+        bar_y = current_y
+        total_time_str = f"{self.duration // 1000 // 60:02d}:{(self.duration // 1000) % 60:02d}"
+        cur_time_str = f"{self.progress // 1000 // 60:02d}:{(self.progress // 1000) % 60:02d}"
+        draw_text_shadow(cur_time_str, (bar_start_x - 30, bar_y), font_time, anchor="rm")
+        draw_text_shadow(total_time_str, (bar_end_x + 30, bar_y), font_time, anchor="lm")
+        old_state = random.getstate()
+        random.seed(self.title + str(self.duration))
+        num_bars = 65
+        bar_spacing = bar_width / num_bars
+        bar_w = max(4, int(bar_spacing * 0.5))
+        max_h, min_h = 50, 6
+        active_bars = int(num_bars * (self.progress / self.duration)) if self.duration > 0 else 0
+        for i in range(num_bars):
+            base_h = random.randint(min_h, max_h)
+            edge_factor = 1.0 - abs((i - num_bars / 2) / (num_bars / 2))
+            h = max(min_h, int(base_h * 0.4 + max_h * edge_factor * 0.6))
+            x_center = bar_start_x + i * bar_spacing
+            color = (255, 255, 255, 255) if i < active_bars else (80, 80, 80, 100)
+            draw.rounded_rectangle(
+                (x_center - bar_w / 2, bar_y - h / 2, x_center + bar_w / 2, bar_y + h / 2),
+                radius=int(bar_w / 2),
+                fill=color,
+            )
+        random.setstate(old_state)
+        current_y += 80
+        if self.album_title:
+            font_album = get_font(50)
+            album_text = self.album_title if len(self.album_title) <= 50 else self.album_title[:50] + "..."
+            draw_text_shadow(album_text, (center_x, current_y), font_album, fill=(230, 230, 230))
+            current_y += 60
+        if self.meta_info:
+            font_meta = get_font(40)
+            draw_text_shadow(self.meta_info, (center_x, current_y), font_meta, fill=(210, 210, 210))
+        by = io.BytesIO()
+        background.save(by, format="PNG")
+        by.seek(0)
+        by.name = "banner.png"
+        return by
 
 
 @loader.tds
-class YandexMusicMod(loader.Module):
-    """🎧 Яндекс Музыка: полный async-SDK + пульт в одном файле"""
+class YanMusicMod(loader.Module):
+    """Card with the currently playing track on Yandex Music."""
 
     strings = {
-        "name": "YandexMusic",
-        "no_token": "❌ Нет токена. Сначала: <code>.ymauth</code> или <code>.ymtoken &lt;токен&gt;</code>",
-        "saved": "✅ Токен сохранён",
-        "need_args": "❌ Нужен аргумент",
-        "state_title": "🎧 <b>Сейчас играет</b>",
-        "paused": "⏸ Пауза",
-        "playing": "▶️ Играет",
-        "sent": "✅ {}",
-        "vol": "🔊 Громкость → {}",
-        "bad_vol": "❌ Громкость: 0-100 или 0.0-1.0",
-        "devices_title": "📱 <b>Устройства:</b>",
-        "auth_text": (
+        "name": "YanMusic",
+        "need_auth": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Please execute"
+            " </b><code>.ymauth</code><b> before performing this action.</b>"
+        ),
+        "skipped": (
+            "<tg-emoji emoji-id=6037622221625626773>➡️</tg-emoji> <b>Skipped track.</b>"
+        ),
+        "playing": "<tg-emoji emoji-id=5773626993010546707>▶️</tg-emoji> <b>Playing...</b>",
+        "back": (
+            "<tg-emoji emoji-id=6039539366177541657>⬅️</tg-emoji> <b>Switched to previous"
+            " track</b>"
+        ),
+        "paused": "<tg-emoji emoji-id=5774077015388852135>❌</tg-emoji> <b>Pause</b>",
+        "toggled": "<tg-emoji emoji-id=5843596438373667352>✅️</tg-emoji> <b>Toggled.</b>",
+        "liked": (
+            "<tg-emoji emoji-id=5258179403652801593>❤️</tg-emoji> <b>Liked current"
+            " playback</b>"
+        ),
+        "unlike": (
+            "<tg-emoji emoji-id=5774077015388852135>❌</tg-emoji>"
+            " <b>Unliked current playback</b>"
+        ),
+        "err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>An error occurred."
+            "</b>\n<code>{}</code>"
+        ),
+        "already_authed": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Already authorized</b>"
+        ),
+        "authed": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Authentication"
+            " successful</b>"
+        ),
+        "deauth": (
+            "<tg-emoji emoji-id=5877341274863832725>🚪</tg-emoji> <b>Successfully logged out"
+            " of account</b>"
+        ),
+        "auth": (
+            "🔑 <b>Yandex Music authorization</b>\n\n"
+            "1. Open the link and allow access:\n"
+            f"{AUTH_URL}\n\n"
+            "2. You will land on <code>music.yandex.ru/#access_token=...</code> — "
+            "copy the part after <code>access_token=</code> up to <code>&</code>\n"
+            "3. Save: <code>.ymtoken &lt;token&gt;</code>\n\n"
+            "Or automatically: <code>.ymcode</code>"
+        ),
+        "no_music": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>No music is playing!</b>"
+        ),
+        "no_device": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>No active device — start music in the app.</b>"
+        ),
+        "queue_edge": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Queue boundary (first/last track).</b>"
+        ),
+        "dl_err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Failed to download"
+            " track.</b>"
+        ),
+        "volume_changed": (
+            "<tg-emoji emoji-id=5890997763331591703>🔊</tg-emoji>"
+            " <b>Volume changed to {}%.</b>"
+        ),
+        "volume_invalid": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Volume level must be"
+            " a number between 0 and 100.</b>"
+        ),
+        "volume_err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>An error occurred while"
+            " changing volume.</b>"
+        ),
+        "no_volume_arg": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Please specify a"
+            " volume level between 0 and 100.</b>"
+        ),
+        "searching_tracks": (
+            "<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <b>Searching for tracks"
+            " matching {}...</b>"
+        ),
+        "no_search_query": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Please specify a"
+            " search query.</b>"
+        ),
+        "no_tracks_found": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>No tracks found for"
+            " {}.</b>"
+        ),
+        "search_results": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Search results for"
+            " {}:</b>\n\n{}"
+        ),
+        "search_results_inline": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Found {count} results"
+            " for {query}.</b>\n<b>Select a track:</b>"
+        ),
+        "downloading_search_track": (
+            "<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <b>Downloading {}...</b>"
+        ),
+        "download_success": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Successfully downloaded {} - {}</b>"
+        ),
+        "invalid_track_number": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Invalid track number."
+            " Please search first or provide a valid number from the list.</b>"
+        ),
+        "device_list": (
+            "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Available devices:</b>\n{}"
+        ),
+        "no_devices_found": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>No devices found.</b>"
+        ),
+        "device_transfer_na": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Device switching is not exposed by upstream Ynison — control playback on the device itself.</b>"
+        ),
+        "invalid_device_id": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Invalid device ID."
+            " Use</b> <code>.ymdev</code> <b>to see available devices.</b>"
+        ),
+        "no_ytdlp": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>yt-dlp not found... Check config or install yt-dlp (<code>{}terminal pip install yt-dlp</code>)</b>",
+        "snowt_failed": "\n\n<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Download failed</b>",
+        "uploading_banner": "\n\n<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <i>Uploading banner...</i>",
+        "downloading_track": "\n\n<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <i>Downloading track...</i>",
+        "no_playlists": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>No playlists found.</b>",
+        "playlists_list": "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Your playlists:</b>\n\n{}",
+        "added_to_playlist": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Added {} to {}</b>",
+        "removed_from_playlist": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Removed {} from {}</b>",
+        "invalid_playlist_index": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Invalid playlist number.</b>",
+        "no_cached_playlists": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Use .ymplaylists first.</b>",
+        "playlist_created": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Playlist {} created.</b>",
+        "playlist_deleted": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Playlist {} deleted.</b>",
+        "no_playlist_name": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Please specify a playlist name.</b>",
+        "account": "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Account:</b> <b>{}</b> <code>{}</code>",
+        "likes_count": "<tg-emoji emoji-id=5258179403652801593>❤️</tg-emoji> <b>Liked tracks: {}</b>",
+        "ynison_need_restart": "⏳ Ynison delivered, restart needed: <code>.restart</code> — then repeat the command.",
+    }
+
+    strings_ru = {
+        "_cls_doc": "Карточка с играющим треком в Яндекс Музыке.",
+        "need_auth": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Выполни"
+            " </b><code>.ymauth</code><b> перед выполнением этого действия.</b>"
+        ),
+        "err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Произошла ошибка."
+            "</b>\n<code>{}</code>"
+        ),
+        "skipped": (
+            "<tg-emoji emoji-id=6037622221625626773>➡️</tg-emoji> <b>Трек пропущен.</b>"
+        ),
+        "playing": "<tg-emoji emoji-id=5773626993010546707>▶️</tg-emoji> <b>Играет...</b>",
+        "back": (
+            "<tg-emoji emoji-id=6039539366177541657>⬅️</tg-emoji> <b>Переключено на предыдущий трек</b>"
+        ),
+        "paused": "<tg-emoji emoji-id=5774077015388852135>❌</tg-emoji> <b>Пауза</b>",
+        "toggled": "<tg-emoji emoji-id=5843596438373667352>✅️</tg-emoji> <b>Переключено.</b>",
+        "liked": (
+            "<tg-emoji emoji-id=5258179403652801593>❤️</tg-emoji> <b>Текущий трек добавлен в избранное</b>"
+        ),
+        "unlike": (
+            "<tg-emoji emoji-id=5774077015388852135>❌</tg-emoji> <b>Убрал лайк с текущего трека</b>"
+        ),
+        "already_authed": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Уже авторизован</b>"
+        ),
+        "authed": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Успешная аутентификация</b>"
+        ),
+        "deauth": (
+            "<tg-emoji emoji-id=5877341274863832725>🚪</tg-emoji> <b>Успешный выход из аккаунта</b>"
+        ),
+        "auth": (
             "🔑 <b>Авторизация Яндекс Музыки</b>\n\n"
             "1. Открой ссылку и разреши доступ:\n"
             f"{AUTH_URL}\n\n"
             "2. Тебя кинет на <code>music.yandex.ru/#access_token=...</code> — "
             "скопируй кусок после <code>access_token=</code> до <code>&</code>\n"
             "3. Сохрани: <code>.ymtoken &lt;токен&gt;</code>\n\n"
-            "Либо автоматически: <code>.ymcode</code> (придёт код — введи его на сайте)"
+            "Либо автоматически: <code>.ymcode</code>"
         ),
+        "no_music": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Музыка не играет!</b>"
+        ),
+        "no_device": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Нет активного устройства — включи музыку в приложении.</b>"
+        ),
+        "queue_edge": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Граница очереди (первый/последний трек).</b>"
+        ),
+        "dl_err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Не удалось скачать трек.</b>"
+        ),
+        "volume_changed": (
+            "<tg-emoji emoji-id=5890997763331591703>🔊</tg-emoji>"
+            " <b>Громкость изменена на {}%.</b>"
+        ),
+        "volume_invalid": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Уровень громкости должен"
+            " быть числом от 0 до 100.</b>"
+        ),
+        "volume_err": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Произошла ошибка при"
+            " изменении громкости.</b>"
+        ),
+        "no_volume_arg": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Пожалуйста, укажите"
+            " уровень громкости от 0 до 100.</b>"
+        ),
+        "searching_tracks": (
+            "<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <b>Идет поиск треков"
+            " по запросу {}...</b>"
+        ),
+        "no_search_query": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Пожалуйста, укажите"
+            " поисковый запрос.</b>"
+        ),
+        "no_tracks_found": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>По запросу '{}'"
+            " ничего не найдено.</b>"
+        ),
+        "search_results": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Результаты поиска"
+            " по запросу {}:</b>\n\n{}"
+        ),
+        "search_results_inline": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Найдено {count} результатов"
+            " по запросу {query}.</b>\n<b>Выберите трек:</b>"
+        ),
+        "downloading_search_track": (
+            "<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <b>Скачиваю {}...</b>"
+        ),
+        "download_success": (
+            "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Трек {} - {} успешно скачан.</b>"
+        ),
+        "invalid_track_number": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Некорректный номер трека."
+            " Сначала выполните поиск или укажите правильный номер из списка.</b>"
+        ),
+        "device_list": (
+            "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Доступные устройства:</b>\n{}"
+        ),
+        "no_devices_found": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Устройства не найдены.</b>"
+        ),
+        "device_transfer_na": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Переключение устройств не поддерживается upstream Ynison — управляй воспроизведением на самом устройстве.</b>"
+        ),
+        "invalid_device_id": (
+            "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Некорректный ID устройства."
+            " Используйте</b> <code>.ymdev</code><b>, чтобы увидеть доступные устройства.</b>"
+        ),
+        "no_ytdlp": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>yt-dlp не найден... Проверьте конфиг или установите yt-dlp (<code>{}terminal pip install yt-dlp</code>)</b>",
+        "snowt_failed": "\n\n<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Ошибка скачивания.</b>",
+        "uploading_banner": "\n\n<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <i>Загрузка баннера...</i>",
+        "downloading_track": "\n\n<tg-emoji emoji-id=5841359499146825803>🕔</tg-emoji> <i>Скачивание трека...</i>",
+        "no_playlists": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Плейлисты не найдены.</b>",
+        "playlists_list": "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Ваши плейлисты:</b>\n\n{}",
+        "added_to_playlist": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Трек {} добавлен в {}</b>",
+        "removed_from_playlist": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Трек {} удален из {}</b>",
+        "invalid_playlist_index": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Неверный номер плейлиста.</b>",
+        "no_cached_playlists": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Сначала используйте .ymplaylists.</b>",
+        "playlist_created": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Плейлист {} создан.</b>",
+        "playlist_deleted": "<tg-emoji emoji-id=5776375003280838798>✅</tg-emoji> <b>Плейлист {} удален.</b>",
+        "no_playlist_name": "<tg-emoji emoji-id=5778527486270770928>❌</tg-emoji> <b>Пожалуйста, укажите название плейлиста.</b>",
+        "account": "<tg-emoji emoji-id=5956561916573782596>📄</tg-emoji> <b>Аккаунт:</b> <b>{}</b> <code>{}</code>",
+        "likes_count": "<tg-emoji emoji-id=5258179403652801593>❤️</tg-emoji> <b>Треков в лайках: {}</b>",
+        "ynison_need_restart": "⏳ Ynison доставлен, нужен рестарт: <code>.restart</code> — затем повтори команду.",
     }
 
     def __init__(self):
@@ -1435,13 +1929,102 @@ class YandexMusicMod(loader.Module):
                 "Таймаут Ynison, сек",
                 validator=loader.validators.Float(minimum=5.0, maximum=120.0),
             ),
+            loader.ConfigValue(
+                "show_banner",
+                True,
+                "Show banner with track info",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "custom_text",
+                (
+                    "<tg-emoji emoji-id=6007938409857815902>🎧</tg-emoji> <b>Now playing:</b> {track} — {artists}\n"
+                    "<tg-emoji emoji-id=5877465816030515018>🔗</tg-emoji> <b><a href='{yandex_url}'>yandex music</a></b>"
+                ),
+                "Custom text, supports {track}, {artists}, {album}, {progress}, {duration}, {device}, {yandex_url} placeholders.",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "font",
+                "https://raw.githubusercontent.com/kamekuro/assets/master/fonts/Onest-Bold.ttf",
+                "Custom font. Specify URL to .ttf file",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "ytdlp_path",
+                "yt-dlp",
+                "Path to ytdlp binary",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "cookies_path",
+                "",
+                "Path to your cookies for yt-dlp",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "banner_version",
+                "horizontal",
+                lambda: "Banner version",
+                validator=loader.validators.Choice(["horizontal", "vertical", "ultra"]),
+            ),
+            loader.ConfigValue(
+                "blur_intensity",
+                40,
+                lambda: "Blur intensity",
+                validator=loader.validators.Integer(minimum=0),
+            ),
         )
+        self._ym_store = {}
 
     async def client_ready(self, client, db):
         self._client = client
         self._db = db
 
-    # ---------- helpers ----------
+    def tokenized(func) -> FunctionType:
+        @functools.wraps(func)
+        async def wrapped(*args, **kwargs):
+            self = args[0]
+            if not self._token():
+                await utils.answer(args[1], self.strings("need_auth"))
+                return
+            return await func(*args, **kwargs)
+
+        wrapped.__doc__ = func.__doc__
+        wrapped.__module__ = func.__module__
+        return wrapped
+
+    def error_handler(func) -> FunctionType:
+        @functools.wraps(func)
+        async def wrapped(*args, **kwargs):
+            self = args[0]
+            try:
+                return await func(*args, **kwargs)
+            except NoActiveDeviceError:
+                with contextlib.suppress(Exception):
+                    await utils.answer(args[1], self.strings("no_device"))
+            except QueueBoundaryError:
+                with contextlib.suppress(Exception):
+                    await utils.answer(args[1], self.strings("queue_edge"))
+            except Exception as e:
+                error_msg = str(e)
+                if "NO_ACTIVE_DEVICE" in error_msg or "NoActiveDevice" in type(e).__name__:
+                    with contextlib.suppress(Exception):
+                        await utils.answer(args[1], self.strings("no_device"))
+                    return
+                if "QueueBoundary" in type(e).__name__:
+                    with contextlib.suppress(Exception):
+                        await utils.answer(args[1], self.strings("queue_edge"))
+                    return
+                user_error = f"{type(e).__name__}: {error_msg[:200]}"
+                with contextlib.suppress(Exception):
+                    await utils.answer(args[1], self.strings("err").format(utils.escape_html(user_error)))
+
+        wrapped.__doc__ = func.__doc__
+        wrapped.__module__ = func.__module__
+        return wrapped
+
+    # ---------- base helpers ----------
     def _token(self):
         t = (self.config["TOKEN"] or "").strip() or (self.get("token") or "").strip()
         return t or None
@@ -1454,71 +2037,417 @@ class YandexMusicMod(loader.Module):
         dev = (self.config["DEVICE_ID"] or "").strip() or None
         return SDKConfig(token=self._token(), timeout=timeout, device_id=dev)
 
-    def _snap_text(self, snap: Playback) -> str:
-        if snap.paused is True:
-            st = self.strings["paused"]
-        elif snap.paused is False:
-            st = self.strings["playing"]
-        else:
-            st = "❓"
-        title = snap.track_title or "-"
-        if snap.artist_title:
-            title = f"{snap.artist_title} — {title}"
-        bar = _bar(snap.progress_ms, snap.duration_ms)
-        out = [
-            "🪐 <b>Yandex Music</b>",
-            f"🎵 <b>{html.escape(str(title))}</b>",
-            f"{st} | <code>{_fmt_ms(snap.progress_ms)} / {_fmt_ms(snap.duration_ms)}</code>",
-            f"<code>{bar}</code>",
-            f"📱 <code>{html.escape(str(snap.active_device_id or '-'))}</code>",
-        ]
-        if snap.devices:
-            out.append("")
-            out.append(self.strings["devices_title"])
-            for d in snap.devices[:10]:
-                mark = "🟢" if d.active else "⚪"
-                out.append(f"{mark} {html.escape(str(d.title or d.id))} <code>{html.escape(d.id)}</code>")
-        out.append("")
-        out.append("⚡ <i>YandexMusic v1.3.0</i>")
-        return "\n".join(out)
-
-    async def _banner(self, message: Message, snap: Playback, token: str) -> None:
-        """Баннер трека: обложка + подпись. Без обложки — просто текст."""
-        caption = self._snap_text(snap)
-        try:
-            cover = await _resolve_cover(token, snap)
-        except Exception:
-            cover = None
-        if cover:
-            try:
-                await utils.answer_file(message, cover, caption)
-                return
-            except Exception:
-                pass
-        await utils.answer(message, caption)
+    def _rest(self) -> AsyncYandexMusic:
+        token = self._token()
+        if not token:
+            raise AuthenticationError("no token")
+        return AsyncYandexMusic(token=token)
 
     async def _need_remote(self, message: Message):
-        """Токен + ynison. Возвращает cfg или None (ответ уже отправлен)."""
         if not self._token():
-            await utils.answer(message, self.strings["no_token"])
+            await utils.answer(message, self.strings("need_auth"))
             return None
         ok, hint = await _ensure_ynison()
         if not ok:
             if hint == "restart":
-                await utils.answer(
-                    message,
-                    "⏳ Ynison доставлен, нужен рестарт: <code>.restart</code> — затем повтори команду.",
-                )
+                await utils.answer(message, self.strings("ynison_need_restart"))
             else:
-                await utils.answer(message, f"❌ Ynison не встал: <code>{html.escape(hint)}</code>")
+                await utils.answer(message, self.strings("err").format(utils.escape_html(hint)))
             return None
         return self._cfg()
+
+    def _get_chat_id(self, target):
+        if isinstance(target, int):
+            return target
+        if not target:
+            return None
+        chat_id = getattr(target, "chat_id", None)
+        if chat_id:
+            return chat_id
+        with contextlib.suppress(Exception):
+            return utils.get_chat_id(target)
+        return None
+
+    def _reply_id(self, message):
+        reply_to_id = getattr(message, "reply_to_msg_id", None)
+        if reply_to_id:
+            return reply_to_id
+        reply_to = getattr(message, "reply_to", None)
+        return getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+
+    def _short_text(self, text: str, limit: int = 60) -> str:
+        text = " ".join(str(text).split())
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3] + "..."
+
+    def _track_info(self, track_info) -> tuple:
+        if isinstance(track_info, dict):
+            track_name = track_info.get("name", "Unknown")
+            artists_list = [a.get("name") for a in track_info.get("artists", []) if a.get("name")]
+            artists = ", ".join(artists_list) if artists_list else "Unknown Artist"
+            return track_name, artists
+        if isinstance(track_info, (list, tuple)):
+            track_name = track_info[0] if len(track_info) > 0 else "Unknown"
+            artists = track_info[1] if len(track_info) > 1 else "Unknown Artist"
+            if not artists:
+                artists = "Unknown Artist"
+            return track_name or "Unknown", artists
+        # Yandex upstream Track object
+        title = getattr(track_info, "title", None) or getattr(track_info, "name", None) or "Unknown"
+        raw_artists = getattr(track_info, "artists", None) or []
+        names = []
+        for a in raw_artists:
+            n = getattr(a, "name", None) or getattr(a, "title", None)
+            if n:
+                names.append(n)
+        artists = ", ".join(names) if names else "Unknown Artist"
+        return title, artists
+
+    def _cover_url_from_track(self, track) -> str | None:
+        uri = getattr(track, "cover_uri", None)
+        if not uri:
+            # dict variant (rare)
+            if isinstance(track, dict):
+                images = (((track.get("album") or {}).get("images")) or [])
+                if images:
+                    return images[0].get("url")
+            return None
+        return "https://" + str(uri).replace("%%", "400x400")
+
+    async def _cover_bytes(self, token: str, snap) -> bytes | None:
+        """Обложка трека bytes через REST: сначала по id, потом поиском."""
+        def _fetch(url: str) -> bytes | None:
+            try:
+                r = requests.get(url, timeout=15)
+                if r.ok and r.content:
+                    return r.content
+            except Exception:
+                pass
+            return None
+
+        try:
+            async with AsyncYandexMusic(token=token) as ym:
+                tid = getattr(snap, "track_id", None)
+                if tid:
+                    try:
+                        tracks = await ym.tracks.get([str(tid)])
+                        if tracks:
+                            url = self._cover_url_from_track(tracks[0])
+                            if url:
+                                data = await asyncio.to_thread(_fetch, url)
+                                if data:
+                                    return data
+                    except Exception:
+                        pass
+                query = " ".join(x for x in (snap.artist_title, snap.track_title) if x)
+                if query:
+                    try:
+                        res = await ym.search.query(query)
+                        results = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
+                        if results:
+                            url = self._cover_url_from_track(results[0])
+                            if url:
+                                data = await asyncio.to_thread(_fetch, url)
+                                if data:
+                                    return data
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return None
+
+    async def _placeholder_cover(self) -> bytes:
+        def _make():
+            img = Image.new("RGBA", (1000, 1000), (20, 20, 25, 255))
+            by = io.BytesIO()
+            img.save(by, format="PNG")
+            return by.getvalue()
+        return await asyncio.to_thread(_make)
+
+    def _yandex_url(self, snap, track_name: str = "", artists: str = "") -> str:
+        import urllib.parse
+        q = " ".join(x for x in (artists, track_name) if x) or " ".join(
+            x for x in (getattr(snap, "artist_title", "") or "", getattr(snap, "track_title", "") or "") if x
+        )
+        return "https://music.yandex.ru/search?text=" + urllib.parse.quote(q or "yandex music")
+
+    async def _card_text(self, snap, album_title: str = "") -> str:
+        track = getattr(snap, "track_title", None) or "-"
+        artists = getattr(snap, "artist_title", None) or ""
+        prog = getattr(snap, "progress_ms", None) or 0
+        dur = getattr(snap, "duration_ms", None) or 0
+        device = getattr(snap, "active_device_id", None) or ""
+        sdata = {
+            "track": utils.escape_html(str(track)),
+            "artists": utils.escape_html(str(artists)),
+            "album": utils.escape_html(str(album_title or "")),
+            "duration": f"{dur // 1000 // 60}:{dur // 1000 % 60:02}",
+            "progress": f"{prog // 1000 // 60}:{prog // 1000 % 60:02}",
+            "device": utils.escape_html(str(device)),
+            "yandex_url": self._yandex_url(snap, str(track), str(artists)),
+            "songlink": self._yandex_url(snap, str(track), str(artists)),
+            "spotify_url": self._yandex_url(snap, str(track), str(artists)),
+            "playlist": "",
+            "playlist_owner": "",
+        }
+        try:
+            data = await utils.get_placeholders(sdata, self.config["custom_text"])
+        except Exception:
+            data = sdata
+        try:
+            return self.config["custom_text"].format(**data)
+        except Exception:
+            return f"🎧 <b>{sdata['track']}</b> — {sdata['artists']}"
+
+    async def _show_card(self, message: Message, snap, token: str, album_title: str = "") -> None:
+        text = await self._card_text(snap, album_title)
+        if not self.config["show_banner"]:
+            await utils.answer(message, text)
+            return
+        tmp_msg = await utils.answer(message, text + self.strings("uploading_banner"))
+        try:
+            cover = await self._cover_bytes(token, snap)
+        except Exception:
+            cover = None
+        if not cover:
+            cover = await self._placeholder_cover()
+        try:
+            banners = Banners(
+                title=str(getattr(snap, "track_title", None) or "-"),
+                artists=str(getattr(snap, "artist_title", None) or ""),
+                duration=int(getattr(snap, "duration_ms", None) or 0),
+                progress=int(getattr(snap, "progress_ms", None) or 0),
+                track_cover=cover,
+                font=self.config["font"],
+                blur=int(self.config["blur_intensity"] or 0),
+                album_title=str(album_title or ""),
+                meta_info="Yandex Music",
+            )
+            version = self.config["banner_version"]
+            if version == "ultra":
+                file = await asyncio.to_thread(banners.ultra)
+            elif version == "vertical":
+                file = await asyncio.to_thread(banners.vertical)
+            else:
+                file = await asyncio.to_thread(banners.horizontal)
+            await utils.answer(tmp_msg, text, file=file)
+        except Exception as e:
+            await utils.answer(message, text + f"\n<code>{html.escape(str(e)[:200])}</code>")
+
+    async def _album_of_snap(self, token: str, snap) -> str:
+        try:
+            tid = getattr(snap, "track_id", None)
+            if not tid:
+                return ""
+            async with AsyncYandexMusic(token=token) as ym:
+                tracks = await ym.tracks.get([str(tid)])
+                if not tracks:
+                    return ""
+                albums = getattr(tracks[0], "albums", None) or []
+                if albums:
+                    return str(getattr(albums[0], "title", "") or "")
+        except Exception:
+            pass
+        return ""
+
+    # ---------- yt-dlp download (1:1 SpotifyMod) ----------
+    def _ytdlp_bin(self) -> str:
+        return (self.config["ytdlp_path"] or "yt-dlp").strip() or "yt-dlp"
+
+    async def _download_track(
+        self,
+        target,
+        query,
+        caption=None,
+        track_name=None,
+        artists=None,
+        log_context=None,
+        reply_to_id=None,
+    ) -> bool:
+        import shutil
+        dl_dir = os.path.join(os.getcwd(), "yanmusicmod")
+        if not os.path.exists(dl_dir):
+            os.makedirs(dl_dir, exist_ok=True)
+        for f in os.listdir(dl_dir):
+            try:
+                os.remove(os.path.join(dl_dir, f))
+            except Exception:
+                pass
+        success = False
+        if caption is None:
+            safe_track = utils.escape_html(track_name or "Unknown")
+            safe_artists = utils.escape_html(artists or "Unknown Artist")
+            caption = self.strings["download_success"].format(safe_track, safe_artists)
+
+        async def send_text(text: str) -> bool:
+            if target is None:
+                return False
+            if isinstance(target, int):
+                await self._client.send_message(target, text, reply_to=reply_to_id)
+                return True
+            try:
+                await utils.answer(target, text)
+                return True
+            except Exception:
+                chat_id = self._get_chat_id(target)
+                if chat_id is None:
+                    return False
+                await self._client.send_message(chat_id, text, reply_to=reply_to_id)
+                return True
+
+        async def send_file(file_path: str) -> bool:
+            if target is None:
+                return False
+            if isinstance(target, int):
+                await self._client.send_file(target, file_path, caption=caption, reply_to=reply_to_id)
+                return True
+            try:
+                await utils.answer(target, caption, file=file_path)
+                return True
+            except Exception:
+                chat_id = self._get_chat_id(target)
+                if chat_id is None:
+                    return False
+                await self._client.send_file(chat_id, file_path, caption=caption, reply_to=reply_to_id)
+                return True
+
+        ybin = self._ytdlp_bin()
+        if not shutil.which(ybin) and not os.path.isfile(ybin):
+            await send_text(self.strings["no_ytdlp"].format(""))
+            return False
+        try:
+            squery = query.replace('"', "").replace("'", "")
+            cookies = self.config["cookies_path"]
+            if cookies:
+                cmd = (
+                    f'{ybin} -x --impersonate="" --cookies {cookies} --audio-format mp3 --add-metadata '
+                    f'--audio-quality 0 -o "{dl_dir}/%(title)s [%(id)s].%(ext)s" '
+                    f'"ytsearch1:{squery}"'
+                )
+            else:
+                cmd = (
+                    f'{ybin} -x --impersonate="" --audio-format mp3 --add-metadata '
+                    f'--audio-quality 0 -o "{dl_dir}/%(title)s [%(id)s].%(ext)s" '
+                    f'"ytsearch1:{squery}"'
+                )
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            files = [f for f in os.listdir(dl_dir) if f.endswith(".mp3")]
+            if files:
+                first = files[0]
+                target_file = os.path.join(dl_dir, first)
+                success = await send_file(target_file)
+                if not success:
+                    await send_text(self.strings["dl_err"])
+            else:
+                await send_text(self.strings["snowt_failed"])
+        except Exception:
+            await send_text(self.strings["dl_err"])
+        finally:
+            if os.path.exists(dl_dir):
+                for f in os.listdir(dl_dir):
+                    try:
+                        os.remove(os.path.join(dl_dir, f))
+                    except Exception:
+                        pass
+        return success
+
+    def _search_keyboard(self, tracks: list, chat_id=None, reply_to_id=None) -> list:
+        keyboard = []
+        for track in tracks:
+            track_name, artists = self._track_info(track)
+            label = f"{track_name} — {artists}" if artists else track_name
+            keyboard.append(
+                [
+                    {
+                        "text": self._short_text(label),
+                        "callback": self._inline_download_track,
+                        "args": (track_name, artists, reply_to_id, chat_id),
+                    }
+                ]
+            )
+        return keyboard
+
+    async def _inline_download_track(self, call, track_name: str, artists: str, reply_to_id=None, chat_id=None):
+        track_name = track_name or "Unknown"
+        artists = artists or "Unknown Artist"
+        with contextlib.suppress(Exception):
+            await call.answer()
+        with contextlib.suppress(Exception):
+            await call.edit(self.strings["downloading_track"].lstrip(), reply_markup=None)
+        target_message = getattr(call, "message", None)
+        if reply_to_id is None:
+            reply_to_id = self._reply_id(target_message)
+        if chat_id is None:
+            chat_id = self._get_chat_id(target_message)
+        if chat_id is None:
+            chat_id = getattr(call, "chat_id", None)
+        if chat_id is None:
+            chat_id = self._get_chat_id(call)
+        if chat_id is None and target_message is None:
+            with contextlib.suppress(Exception):
+                await call.edit(self.strings["dl_err"], reply_markup=None)
+            return
+        target = chat_id if chat_id is not None else target_message
+        success = await self._download_track(
+            target, f"{artists} {track_name}", track_name=track_name, artists=artists,
+            log_context=f"{track_name} - {artists}", reply_to_id=reply_to_id,
+        )
+        if success:
+            with contextlib.suppress(Exception):
+                await call.delete()
+        else:
+            with contextlib.suppress(Exception):
+                await call.edit(self.strings["dl_err"], reply_markup=None)
+
+    async def _inline_search_tracks(self, query):
+        if not self._token():
+            return {"title": "Auth required", "description": "Run .ymauth", "message": self.strings["need_auth"]}
+        query_text = (query.args or "").strip()
+        if not query_text:
+            return {"title": "No query", "description": "Provide search query", "message": self.strings["no_search_query"]}
+        try:
+            async with self._rest() as ym:
+                res = await ym.search.query(query_text)
+            tracks = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
+            tracks = list(tracks)[:5]
+        except Exception as e:
+            return {"title": "Search error", "description": "Try again", "message": self.strings["err"].format(utils.escape_html(str(e)[:100]))}
+        if not tracks:
+            return {"title": "No results", "description": self._short_text(query_text, limit=60), "message": self.strings["no_tracks_found"].format(utils.escape_html(query_text))}
+        store_id = id(tracks)
+        self._ym_store[store_id] = [self._track_info(t) for t in tracks]
+        entries = []
+        for i, track in enumerate(tracks):
+            track_name, artists = self._track_info(track)
+            thumb = self._cover_url_from_track(track)
+            if thumb:
+                thumb = thumb.replace("400x400", "200x200")
+            entries.append(
+                {
+                    "title": self._short_text(track_name, limit=60),
+                    "description": self._short_text(artists, limit=60) if artists else "",
+                    "message": f"{self.strings['downloading_track'].lstrip()}\n<i>ymdl_{store_id}_{i}</i>",
+                    "thumb": thumb,
+                }
+            )
+        return entries
+
+    @loader.inline_handler(ru_doc="<запрос> - поиск треков Yandex Music.")
+    async def ymq(self, query):
+        """<query> - search Yandex Music track"""
+        return await self._inline_search_tracks(query)
 
     # ---------- auth ----------
     @loader.command(ru_doc="Ссылка для получения токена")
     async def ymauth(self, message: Message):
         """Ссылка для получения токена"""
-        await utils.answer(message, self.strings["auth_text"])
+        await utils.answer(message, self.strings["auth"])
 
     @loader.command(ru_doc="Вход кодом с сайта (автосохранение токена)")
     async def ymcode(self, message: Message):
@@ -1531,7 +2460,6 @@ class YandexMusicMod(loader.Module):
 
         try:
             from yandex_music import ClientAsync
-
             client = ClientAsync()
             task = asyncio.create_task(client.device_auth(on_code=on_code))
             shown = False
@@ -1549,45 +2477,64 @@ class YandexMusicMod(loader.Module):
                     shown = True
             token = await task
         except Exception as e:
-            await utils.answer(message, f"❌ <code>{html.escape(f'{type(e).__name__}: {e}')}</code>")
+            await utils.answer(message, self.strings["err"].format(html.escape(f"{type(e).__name__}: {e}")))
             return
         access = getattr(token, "access_token", None)
         if not access:
-            await utils.answer(message, "❌ Пустой токен")
+            await utils.answer(message, self.strings["err"].format("empty token"))
             return
         self.set("token", access)
         with contextlib.suppress(Exception):
             await message.delete()
-        await utils.answer(message, f"{self.strings['saved']} ✅\n<code>.ymstatus</code> — проверить")
+        await utils.answer(message, f"{self.strings['authed']}\n<code>.ymstatus</code> — проверить")
 
-    @loader.command(ru_doc="Сохранить токен")
+    @loader.command(ru_doc="Сохранить токен: .ymtoken <токен>")
     async def ymtoken(self, message: Message):
         """Сохранить токен: .ymtoken <токен или ссылка>"""
         raw = utils.get_args_raw(message).strip()
         if not raw:
-            await utils.answer(message, self.strings["need_args"])
+            await utils.answer(message, self.strings["no_search_query"].replace("search query", "token"))
             return
         if "access_token=" in raw:
             raw = raw.split("access_token=")[1].split("&")[0].strip()
         self.set("token", raw.strip())
         with contextlib.suppress(Exception):
             await message.delete()
-        await utils.answer(message, self.strings["saved"])
+        await utils.answer(message, self.strings["authed"])
 
-    # ---------- remote (async one-shot) ----------
-    @loader.command(ru_doc="Статус плеера")
+    @error_handler
+    @loader.command(ru_doc="- Выйти из аккаунта")
+    async def ymunauth(self, message: Message):
+        """- Log out"""
+        self.set("token", None)
+        try:
+            self.config["TOKEN"] = ""
+        except Exception:
+            pass
+        await utils.answer(message, self.strings["deauth"])
+
+    # ---------- now playing card (Spotify snow analog) ----------
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymstatus - 🎧 Показать карточку играющего трека", alias="ymn")
     async def ymstatus(self, message: Message):
-        """Статус плеера + баннер"""
+        """| .ymstatus - 🎧 View current track card."""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
-        await utils.answer(message, "⏳ ...")
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-            await self._banner(message, snap, cfg.token)
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        if not getattr(snap, "track_title", None):
+            await utils.answer(message, self.strings["no_music"])
+            return
+        album = await self._album_of_snap(cfg.token, snap)
+        await self._show_card(message, snap, cfg.token, album)
 
+    @error_handler
+    @tokenized
     @loader.command(ru_doc="Что играет + баннер")
     async def ymcur(self, message: Message):
         """Что играет + баннер"""
@@ -1596,71 +2543,103 @@ class YandexMusicMod(loader.Module):
             return
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-            await self._banner(message, snap, cfg.token)
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        if not getattr(snap, "track_title", None):
+            await utils.answer(message, self.strings["no_music"])
+            return
+        album = await self._album_of_snap(cfg.token, snap)
+        await self._show_card(message, snap, cfg.token, album)
 
-    @loader.command(ru_doc="Устройства")
-    async def ymdev(self, message: Message):
-        """Устройства"""
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymd - 🎧 Скачать играющий трек", alias="ymd")
+    async def ymdown(self, message: Message):
+        """| .ymd - 🎧 Download current track."""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
         try:
             snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-            if not snap.devices:
-                await utils.answer(message, "(нет устройств)")
-                return
-            out = [self.strings["devices_title"]]
-            for d in snap.devices:
-                mark = "🟢" if d.active else "⚪"
-                out.append(f"{mark} {html.escape(str(d.title or d.id))} <code>{html.escape(d.id)}</code>")
-            await utils.answer(message, "\n".join(out))
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        track = getattr(snap, "track_title", None) or "Unknown"
+        artists = getattr(snap, "artist_title", None) or "Unknown Artist"
+        if not getattr(snap, "track_title", None):
+            await utils.answer(message, self.strings["no_music"])
+            return
+        album = await self._album_of_snap(cfg.token, snap)
+        text = await self._card_text(snap, album)
+        msg = await utils.answer(message, text + self.strings["downloading_track"])
+        await self._download_track(msg, f"{artists} {track}", caption=text, track_name=str(track), artists=str(artists))
 
-    async def _do(self, coro, message: Message, label: str, banner: bool = False):
+    # ---------- devices ----------
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymdev - 🎵 Список устройств")
+    async def ymdev(self, message: Message):
+        """| .ymdev - 🎵 Devices"""
+        cfg = await self._need_remote(message)
+        if cfg is None:
+            return
+        args = utils.get_args_raw(message).strip()
+        try:
+            snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        devices = list(getattr(snap, "devices", ()) or [])
+        if args:
+            await utils.answer(message, self.strings["device_transfer_na"])
+            return
+        if not devices:
+            await utils.answer(message, self.strings["no_devices_found"])
+            return
+        lines = ""
+        for i, d in enumerate(devices):
+            title = getattr(d, "title", None) or getattr(d, "id", "?")
+            active = "(active)" if getattr(d, "active", False) else ""
+            lines += f"<b>{i + 1}.</b> {utils.escape_html(str(title))} {active}\n"
+        await utils.answer(message, self.strings["device_list"].format(lines.strip()))
+
+    # ---------- transport ----------
+    async def _do(self, coro, message: Message, ok_key: str):
         cfg = await self._need_remote(message)
         if cfg is None:
             return
         try:
             await coro(cfg)
-            if banner:
-                # Даём серверу переключить трек — затем баннер нового трека.
-                await asyncio.sleep(2.5)
-                try:
-                    snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
-                    await self._banner(message, snap, cfg.token)
-                    return
-                except Exception:
-                    pass
-            await utils.answer(message, self.strings["sent"].format(label))
-        except NoActiveDeviceError:
-            await utils.answer(message, "⏹ Нет активного устройства — включи музыку в приложении")
-        except QueueBoundaryError:
-            await utils.answer(message, "⛔ Граница очереди")
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            await utils.answer(message, self.strings[ok_key])
+        except (NoActiveDeviceError, RemoteError, SDKError) as e:
+            name = type(e).__name__
+            if "NoActiveDevice" in name or isinstance(e, NoActiveDeviceError):
+                await utils.answer(message, self.strings["no_device"])
+            elif "QueueBoundary" in name or isinstance(e, QueueBoundaryError):
+                await utils.answer(message, self.strings["queue_edge"])
+            else:
+                await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
-    @loader.command(ru_doc="Пауза")
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ⏸ Пауза")
     async def ympause(self, message: Message):
-        """Пауза"""
-        await self._do(
-            lambda cfg: aonshot_pause(cfg.token, cfg.device_id, cfg.timeout),
-            message, "⏸ пауза",
-        )
+        """- ⏸ Pause"""
+        await self._do(lambda cfg: aonshot_pause(cfg.token, cfg.device_id, cfg.timeout), message, "paused")
 
-    @loader.command(ru_doc="Продолжить")
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ▶️ Продолжить")
     async def ymplay(self, message: Message):
-        """Продолжить"""
-        await self._do(
-            lambda cfg: aonshot_resume(cfg.token, cfg.device_id, cfg.timeout),
-            message, "▶️ play",
-        )
+        """- ▶️ Resume"""
+        await self._do(lambda cfg: aonshot_resume(cfg.token, cfg.device_id, cfg.timeout), message, "playing")
 
-    @loader.command(ru_doc="Тоггл")
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ⏯ Пауза/продолжить")
     async def ymtoggle(self, message: Message):
-        """Пауза/продолжить"""
+        """- ⏯ Toggle"""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
@@ -1670,144 +2649,431 @@ class YandexMusicMod(loader.Module):
                 await aonshot_resume(cfg.token, cfg.device_id, cfg.timeout)
             else:
                 await aonshot_pause(cfg.token, cfg.device_id, cfg.timeout)
-            await utils.answer(message, self.strings["sent"].format("⏯ toggle"))
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            await utils.answer(message, self.strings["toggled"])
+        except (NoActiveDeviceError, RemoteError, SDKError) as e:
+            name = type(e).__name__
+            if "NoActiveDevice" in name:
+                await utils.answer(message, self.strings["no_device"])
+            elif "QueueBoundary" in name:
+                await utils.answer(message, self.strings["queue_edge"])
+            else:
+                await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
-    @loader.command(ru_doc="Следующий трек + баннер")
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ⏭ Следующий трек + баннер")
     async def ymnext(self, message: Message):
-        """Следующий трек + баннер"""
-        await self._do(
-            lambda cfg: aonshot_next(cfg.token, cfg.device_id, cfg.timeout),
-            message, "⏭ next", banner=True,
-        )
-
-    @loader.command(ru_doc="Предыдущий трек + баннер")
-    async def ymprev(self, message: Message):
-        """Предыдущий трек + баннер"""
-        await self._do(
-            lambda cfg: aonshot_prev(cfg.token, cfg.device_id, cfg.timeout),
-            message, "⏮ prev", banner=True,
-        )
-
-    @loader.command(ru_doc="Громкость: .ymvol 50")
-    async def ymvol(self, message: Message):
-        """Громкость: .ymvol 50"""
+        """- ⏭ Next track"""
         cfg = await self._need_remote(message)
         if cfg is None:
             return
-        raw = utils.get_args_raw(message).strip().split()
-        if not raw:
-            await utils.answer(message, "❌ Громкость: 0-100 или 0.0-1.0")
+        try:
+            await aonshot_next(cfg.token, cfg.device_id, cfg.timeout)
+            await asyncio.sleep(2.5)
+            try:
+                snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+                album = await self._album_of_snap(cfg.token, snap)
+                await self._show_card(message, snap, cfg.token, album)
+                return
+            except Exception:
+                pass
+            await utils.answer(message, self.strings["skipped"])
+        except (NoActiveDeviceError, RemoteError, SDKError) as e:
+            name = type(e).__name__
+            if "NoActiveDevice" in name:
+                await utils.answer(message, self.strings["no_device"])
+            elif "QueueBoundary" in name:
+                await utils.answer(message, self.strings["queue_edge"])
+            else:
+                await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ⏮ Предыдущий трек + баннер")
+    async def ymprev(self, message: Message):
+        """- ⏮ Previous track"""
+        cfg = await self._need_remote(message)
+        if cfg is None:
             return
         try:
-            v = float(raw[0].replace(",", "."))
-        except Exception:
-            await utils.answer(message, "❌ Громкость: 0-100 или 0.0-1.0")
+            await aonshot_prev(cfg.token, cfg.device_id, cfg.timeout)
+            await asyncio.sleep(2.5)
+            try:
+                snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+                album = await self._album_of_snap(cfg.token, snap)
+                await self._show_card(message, snap, cfg.token, album)
+                return
+            except Exception:
+                pass
+            await utils.answer(message, self.strings["back"])
+        except (NoActiveDeviceError, RemoteError, SDKError) as e:
+            name = type(e).__name__
+            if "NoActiveDevice" in name:
+                await utils.answer(message, self.strings["no_device"])
+            elif "QueueBoundary" in name:
+                await utils.answer(message, self.strings["queue_edge"])
+            else:
+                await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymvol - 🔊 Громкость 0-100", alias="ymv")
+    async def ymvol(self, message: Message):
+        """| .ymvol - 🔊 Volume"""
+        cfg = await self._need_remote(message)
+        if cfg is None:
+            return
+        args = utils.get_args_raw(message).strip()
+        if args == "":
+            await utils.answer(message, self.strings["no_volume_arg"])
+            return
+        try:
+            v = float(args.split()[0].replace(",", "."))
+        except ValueError:
+            await utils.answer(message, self.strings["volume_invalid"])
             return
         if v > 1.0:
-            v /= 100.0
+            v = v / 100.0
+        if not 0.0 <= v <= 1.0:
+            await utils.answer(message, self.strings["volume_invalid"])
+            return
         try:
             await aonshot_volume(cfg.token, v, None, cfg.device_id, cfg.timeout)
-            filled = int(round(v * 10))
-            await utils.answer(
-                message, f"🔊 <code>{'▰' * filled}{'▱' * (10 - filled)}</code> {v:.0%}"
-            )
-        except ValueError:
-            await utils.answer(message, "❌ Громкость: 0-100 или 0.0-1.0")
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            await utils.answer(message, self.strings["volume_changed"].format(int(round(v * 100))))
+        except (SDKError, ValueError) as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
-    # ---------- REST (async, ynison не нужен) ----------
-    def _rest(self) -> AsyncYandexMusic:
-        token = self._token()
-        if not token:
-            raise AuthenticationError("no token")
-        return AsyncYandexMusic(token=token)
+    # ---------- likes (current track via REST) ----------
+    async def _current_track_ids(self, cfg) -> tuple | None:
+        snap = await aonshot_state(cfg.token, cfg.device_id, cfg.timeout)
+        tid = getattr(snap, "track_id", None)
+        if not tid:
+            return None
+        album_id = None
+        try:
+            async with AsyncYandexMusic(token=cfg.token) as ym:
+                tracks = await ym.tracks.get([str(tid)])
+                if tracks:
+                    albums = getattr(tracks[0], "albums", None) or []
+                    if albums:
+                        album_id = getattr(albums[0], "id", None)
+        except Exception:
+            pass
+        return str(tid), album_id
 
-    @loader.command(ru_doc="Поиск: .ymsearch Miyagi")
-    async def ymsearch(self, message: Message):
-        """Поиск: .ymsearch Miyagi"""
-        q = utils.get_args_raw(message).strip()
-        if not q:
-            await utils.answer(message, self.strings["need_args"])
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- ❤️ Лайкнуть играющий трек")
+    async def ymlike(self, message: Message):
+        """- ❤️ Like current track"""
+        cfg = await self._need_remote(message)
+        if cfg is None:
             return
         try:
-            ym = self._rest()
-        except AuthenticationError:
-            await utils.answer(message, self.strings["no_token"])
-            return
-        await utils.answer(message, "🔎 ...")
-        try:
-            async with ym:
-                res = await ym.search.query(q)
-            tracks = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
-            if not tracks:
-                await utils.answer(message, "🔎 Ничего не найдено")
+            ids = await self._current_track_ids(cfg)
+            if not ids:
+                await utils.answer(message, self.strings["no_music"])
                 return
-            out = ["🔎 <b>Поиск:</b>"]
-            for t in tracks[:7]:
-                title = getattr(t, "title", "?")
-                arts = ", ".join(a.name for a in (getattr(t, "artists", None) or []) if getattr(a, "name", None))
-                name = f"{arts} — {title}" if arts else str(title)
-                out.append(f"🎵 {html.escape(name)} <code>{getattr(t, 'id', '?')}</code>")
-            await utils.answer(message, "\n".join(out))
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            tid, _ = ids
+            async with self._rest() as ym:
+                await ym.likes.add_track([tid])
+            await utils.answer(message, self.strings["liked"])
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="- 💔 Убрать лайк с играющего трека")
+    async def ymunlike(self, message: Message):
+        """- 💔 Unlike current track"""
+        cfg = await self._need_remote(message)
+        if cfg is None:
+            return
+        try:
+            ids = await self._current_track_ids(cfg)
+            if not ids:
+                await utils.answer(message, self.strings["no_music"])
+                return
+            tid, _ = ids
+            async with self._rest() as ym:
+                await ym.likes.remove_track([tid])
+            await utils.answer(message, self.strings["unlike"])
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
     @loader.command(ru_doc="Лайки-треки")
     async def ymlikes(self, message: Message):
         """Лайки-треки"""
         try:
-            ym = self._rest()
-        except AuthenticationError:
-            await utils.answer(message, self.strings["no_token"])
-            return
-        try:
-            async with ym:
+            async with self._rest() as ym:
                 liked = await ym.likes.tracks()
             try:
-                await utils.answer(message, f"❤️ Треков в лайках: <b>{len(liked)}</b>")
+                n = len(liked)
             except Exception:
-                await utils.answer(message, f"❤️ <code>{html.escape(str(liked)[:500])}</code>")
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+                n = str(liked)[:100]
+            await utils.answer(message, self.strings["likes_count"].format(n))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
-    @loader.command(ru_doc="Мои плейлисты")
-    async def ymplaylists(self, message: Message):
-        """Мои плейлисты"""
+    # ---------- search + download by number (Spotify ssearch analog) ----------
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymsearch - 🔍 Поиск треков.", alias="yms")
+    async def ymsearch(self, message: Message):
+        """| .yms - 🔍 Search for tracks."""
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            await utils.answer(message, self.strings["no_search_query"])
+            return
+        search_results = self.get("last_search_results", [])
+        if args.isdigit() and search_results:
+            track_number = int(args)
+            if 0 < track_number <= len(search_results):
+                msg = await utils.answer(message, self.strings["downloading_track"])
+                track_info = search_results[track_number - 1]
+                track_name, artists = self._track_info(track_info)
+                reply_to_id = self._reply_id(message)
+                chat_id = self._get_chat_id(message)
+                target = chat_id if chat_id is not None else msg
+                success = await self._download_track(
+                    target, f"{artists} {track_name}", track_name=track_name, artists=artists,
+                    log_context=f"{track_name} - {artists}", reply_to_id=reply_to_id,
+                )
+                if success:
+                    with contextlib.suppress(Exception):
+                        await msg.delete()
+                self.set("last_search_results", [])
+                return
+        await utils.answer(message, self.strings["searching_tracks"].format(utils.escape_html(args)))
         try:
-            ym = self._rest()
-        except AuthenticationError:
-            await utils.answer(message, self.strings["no_token"])
+            async with self._rest() as ym:
+                res = await ym.search.query(args)
+            tracks = (getattr(res, "tracks", None) and getattr(res.tracks, "results", None)) or []
+            tracks = list(tracks)[:5]
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        if not tracks:
+            await utils.answer(message, self.strings["no_tracks_found"].format(utils.escape_html(args)))
+            return
+        # cache minimal serializable form
+        cached = []
+        for t in tracks:
+            name, arts = self._track_info(t)
+            cached.append((name, arts))
+        self.set("last_search_results", cached)
+        # monkey: keep objects in memory for buttons via _ym_store
+        store_id = id(tracks)
+        self._ym_store[store_id] = [(self._track_info(t)[0], self._track_info(t)[1]) for t in tracks]
+        # inline buttons expect objects with _track_info support -> pass cached tuples
+        await self.inline.form(
+            self.strings["search_results_inline"].format(count=len(tracks), query=utils.escape_html(args)),
+            message=message,
+            reply_markup=self._search_keyboard(cached, self._get_chat_id(message), self._reply_id(message)),
+        )
+
+    # ---------- playlists ----------
+    def _cache_playlists(self, pls) -> list:
+        out = []
+        for p in pls or []:
+            out.append(
+                {
+                    "kind": getattr(p, "kind", None),
+                    "title": str(getattr(p, "title", "?")),
+                    "revision": getattr(p, "revision", 1) or 1,
+                }
+            )
+        self.set("last_playlists", out)
+        return out
+
+    async def _uid(self) -> int | None:
+        try:
+            async with self._rest() as ym:
+                st = await ym.account.status()
+            acc = getattr(st, "account", None)
+            uid = getattr(acc, "uid", None)
+            return int(uid) if uid is not None else None
+        except Exception:
+            return None
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymplaylists - 📃 Мои плейлисты", alias="ympls")
+    async def ymplaylists(self, message: Message):
+        """| .ympls - 📃 Playlists"""
+        try:
+            async with self._rest() as ym:
+                pls = await ym.playlists.list()
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+            return
+        cached = self._cache_playlists(pls)
+        if not cached:
+            await utils.answer(message, self.strings["no_playlists"])
+            return
+        text = ""
+        for i, p in enumerate(cached[:20]):
+            text += f"<b>{i + 1}.</b> {utils.escape_html(p['title'])} <code>{p['kind']}</code>\n"
+        await utils.answer(message, self.strings["playlists_list"].format(text.strip()))
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ympla - ➕ Добавить текущий трек в плейлист (номер из .ymplaylists)", alias="ympla")
+    async def ympla(self, message: Message):
+        """| .ympla - ➕ Add current track to playlist"""
+        args = utils.get_args_raw(message).strip()
+        if not args or not args.split()[0].isdigit():
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        index = int(args.split()[0]) - 1
+        playlists = self.get("last_playlists", []) or []
+        if not playlists or not (0 <= index < len(playlists)):
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        cfg = await self._need_remote(message)
+        if cfg is None:
             return
         try:
-            async with ym:
-                pls = await ym.playlists.list()
-            out = ["📀 <b>Плейлисты:</b>"]
-            for p in (pls or [])[:15]:
-                out.append(f"• {html.escape(str(getattr(p, 'title', '?')))} <code>{getattr(p, 'kind', '?')}</code>")
-            await utils.answer(message, "\n".join(out))
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            ids = await self._current_track_ids(cfg)
+            if not ids:
+                await utils.answer(message, self.strings["no_music"])
+                return
+            tid, album_id = ids
+            if not album_id:
+                await utils.answer(message, self.strings["err"].format("no album_id for track"))
+                return
+            pl = playlists[index]
+            async with self._rest() as ym:
+                uid = await self._uid()
+                await ym.playlists.insert_track(pl["kind"], tid, album_id, at=0, revision=int(pl.get("revision", 1) or 1), user_id=uid)
+            await utils.answer(message, self.strings["added_to_playlist"].format(utils.escape_html(f"{tid}"), utils.escape_html(pl["title"])))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
 
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymplr - ➖ Убрать текущий трек из плейлиста", alias="ymplr")
+    async def ymplr(self, message: Message):
+        """| .ymplr - ➖ Remove current track from playlist"""
+        args = utils.get_args_raw(message).strip()
+        if not args or not args.split()[0].isdigit():
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        # NOTE: Yandex remove needs position range; find track position first
+        index = int(args.split()[0]) - 1
+        playlists = self.get("last_playlists", []) or []
+        if not playlists or not (0 <= index < len(playlists)):
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        cfg = await self._need_remote(message)
+        if cfg is None:
+            return
+        try:
+            ids = await self._current_track_ids(cfg)
+            if not ids:
+                await utils.answer(message, self.strings["no_music"])
+                return
+            tid, _ = ids
+            pl = playlists[index]
+            async with self._rest() as ym:
+                uid = await self._uid()
+                full = await ym.playlists.get(pl["kind"], user_id=uid)
+                tracks = getattr(full, "tracks", None) or []
+                pos = None
+                for i, tr in enumerate(tracks):
+                    t = getattr(tr, "track", None) or tr
+                    if str(getattr(t, "id", "")) == str(tid):
+                        pos = i
+                        break
+                if pos is None:
+                    await utils.answer(message, self.strings["no_tracks_found"].format(utils.escape_html(str(tid))))
+                    return
+                await ym.playlists.delete_track(pl["kind"], pos, pos + 1, revision=int(pl.get("revision", 1) or 1), user_id=uid)
+            await utils.answer(message, self.strings["removed_from_playlist"].format(utils.escape_html(str(tid)), utils.escape_html(pl["title"])))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ymplc - 🆕 Создать плейлист", alias="ymplc")
+    async def ymplc(self, message: Message):
+        """| .ymplc - 🆕 Create playlist"""
+        name = utils.get_args_raw(message).strip()
+        if not name:
+            await utils.answer(message, self.strings["no_playlist_name"])
+            return
+        try:
+            async with self._rest() as ym:
+                uid = await self._uid()
+                await ym.playlists.create(name, "public", user_id=uid)
+            await utils.answer(message, self.strings["playlist_created"].format(utils.escape_html(name)))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
+    @loader.command(ru_doc="| .ympld - 🗑 Удалить плейлист (номер из .ymplaylists)", alias="ympld")
+    async def ympld(self, message: Message):
+        """| .ympld - 🗑 Delete playlist"""
+        args = utils.get_args_raw(message).strip()
+        if not args or not args.split()[0].isdigit():
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        index = int(args.split()[0]) - 1
+        playlists = self.get("last_playlists", []) or []
+        if not playlists or not (0 <= index < len(playlists)):
+            await utils.answer(message, self.strings["invalid_playlist_index"])
+            return
+        pl = playlists[index]
+        try:
+            async with self._rest() as ym:
+                uid = await self._uid()
+                await ym.playlists.delete(pl["kind"], user_id=uid)
+            await utils.answer(message, self.strings["playlist_deleted"].format(utils.escape_html(pl["title"])))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    @error_handler
+    @tokenized
     @loader.command(ru_doc="Аккаунт")
     async def ymacc(self, message: Message):
         """Аккаунт"""
         try:
-            ym = self._rest()
-        except AuthenticationError:
-            await utils.answer(message, self.strings["no_token"])
-            return
-        try:
-            async with ym:
+            async with self._rest() as ym:
                 st = await ym.account.status()
             acc = getattr(st, "account", None)
-            await utils.answer(
-                message,
-                f"👤 <b>{html.escape(str(getattr(acc, 'login', '?')))}</b> "
-                f"<code>{getattr(acc, 'uid', '?')}</code>",
+            login = getattr(acc, "login", "?")
+            uid = getattr(acc, "uid", "?")
+            await utils.answer(message, self.strings["account"].format(utils.escape_html(str(login)), uid))
+        except Exception as e:
+            await utils.answer(message, self.strings["err"].format(utils.escape_html(str(e)[:200])))
+
+    async def watcher(self, message: Message):
+        """Watcher for inline download tags."""
+        raw = getattr(message, "raw_text", "") or ""
+        if "ymdl_" in raw:
+            try:
+                tag = raw.split("ymdl_")[1].split("</i>")[0]
+                sid, idx = tag.split("_")
+                store_id, index = int(sid), int(idx)
+            except Exception:
+                return
+            data = self._ym_store.pop(store_id, [])
+            if not data or index >= len(data):
+                return
+            track_name, artists = data[index]
+            chat_id = self._get_chat_id(message)
+            if not chat_id:
+                return
+            reply_to_id = self._reply_id(message)
+            success = await self._download_track(
+                chat_id, f"{artists} {track_name}", track_name=track_name, artists=artists,
+                log_context=f"{track_name} - {artists}", reply_to_id=reply_to_id,
             )
-        except SDKError as e:
-            await utils.answer(message, f"❌ <code>{html.escape(str(e))}</code>")
+            if success:
+                with contextlib.suppress(Exception):
+                    await message.delete()
+            return
 
